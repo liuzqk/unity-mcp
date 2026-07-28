@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -15,6 +14,12 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / ".github" / "fork-patches.json"
+CANDIDATE_BRANCH = "automation/upstream-stable"
+VALIDATION_WORKFLOWS = (
+    "python-tests.yml",
+    "unity-tests.yml",
+    "e2e-bridge.yml",
+)
 
 
 def run(*args: str, capture: bool = False) -> str:
@@ -32,8 +37,87 @@ def gh_json(*args: str) -> Any:
     return json.loads(run("gh", *args, capture=True))
 
 
-def safe_branch_component(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
+def git_ref_exists(ref: str) -> bool:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", ref],
+        cwd=ROOT,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode not in {0, 1}:
+        raise RuntimeError(f"Unable to inspect Git ref {ref}")
+    return result.returncode == 0
+
+
+def git_is_ancestor(ancestor: str, descendant: str) -> bool:
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=ROOT,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode not in {0, 1}:
+        raise RuntimeError(
+            f"Unable to compare Git ancestry: {ancestor} -> {descendant}"
+        )
+    return result.returncode == 0
+
+
+def candidate_branch_changed(remote: str, branch: str, release_tag: str) -> bool:
+    remote_ref = f"refs/remotes/{remote}/{branch}"
+    if not git_ref_exists(remote_ref):
+        return True
+    local_tree = run("git", "rev-parse", "HEAD^{tree}", capture=True)
+    remote_tree = run("git", "rev-parse", f"{remote_ref}^{{tree}}", capture=True)
+    return (
+        local_tree != remote_tree
+        or not git_is_ancestor(f"refs/tags/{release_tag}", remote_ref)
+    )
+
+
+def ensure_candidate_validation(
+    repository: str,
+    branch: str,
+    commit: str,
+) -> None:
+    for workflow in VALIDATION_WORKFLOWS:
+        runs = gh_json(
+            "run",
+            "list",
+            "--repo",
+            repository,
+            "--workflow",
+            workflow,
+            "--branch",
+            branch,
+            "--commit",
+            commit,
+            "--event",
+            "workflow_dispatch",
+            "--limit",
+            "1",
+            "--json",
+            "databaseId,status,conclusion,url",
+        )
+        if runs:
+            print(
+                f"{workflow} already has a workflow_dispatch run for {commit[:12]}"
+            )
+            continue
+
+        run(
+            "gh",
+            "workflow",
+            "run",
+            workflow,
+            "--repo",
+            repository,
+            "--ref",
+            branch,
+        )
+        print(f"Dispatched {workflow} for {branch}")
 
 
 def load_config() -> dict[str, Any]:
@@ -154,7 +238,7 @@ def main() -> None:
     if deployed.returncode != 1:
         raise RuntimeError("Unable to compare upstream release with the stable branch")
 
-    candidate_branch = f"automation/upstream-{safe_branch_component(tag)}"
+    candidate_branch = CANDIDATE_BRANCH
     open_prs = gh_json(
         "pr",
         "list",
@@ -169,21 +253,28 @@ def main() -> None:
     )
     if open_prs:
         print(f"Candidate PR already open: #{open_prs[0]['number']}")
-        return
 
     run("git", "checkout", "-B", candidate_branch, f"refs/tags/{tag}")
     for patch in active_patches:
         for commit in patch["commits"]:
             run("git", "cherry-pick", commit)
 
-    run(
-        "git",
-        "push",
-        "--force-with-lease",
-        "--set-upstream",
+    candidate_changed = candidate_branch_changed(
         args.remote,
         candidate_branch,
+        tag,
     )
+    if candidate_changed:
+        run(
+            "git",
+            "push",
+            "--force-with-lease",
+            "--set-upstream",
+            args.remote,
+            candidate_branch,
+        )
+    else:
+        print("Candidate branch tree is unchanged; skipping force-push")
 
     patch_lines = "\n".join(
         f"- {patch['name']} (upstream #{patch['upstream_pr']}, "
@@ -197,7 +288,9 @@ def main() -> None:
         "Unreleased patches replayed:\n\n"
         f"{patch_lines}\n\n"
         "This PR never updates production project dependencies. Merge only after "
-        "the fork's Python, Unity, and multi-Editor gates pass."
+        "the fork's Python, Unity, and multi-Editor gates pass. The automation "
+        "explicitly dispatches branch validation because workflow-token pushes do "
+        "not trigger downstream runs and token-created PR runs may require approval."
     )
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -208,23 +301,50 @@ def main() -> None:
         stream.write(body)
         body_path = stream.name
     try:
-        run(
-            "gh",
-            "pr",
-            "create",
-            "--repo",
-            args.repository,
-            "--base",
-            stable_branch,
-            "--head",
-            candidate_branch,
-            "--title",
-            f"Upgrade internal stable base to {tag}",
-            "--body-file",
-            body_path,
-        )
+        if open_prs:
+            if candidate_changed:
+                run(
+                    "gh",
+                    "pr",
+                    "edit",
+                    str(open_prs[0]["number"]),
+                    "--repo",
+                    args.repository,
+                    "--title",
+                    f"Upgrade internal stable base to {tag}",
+                    "--body-file",
+                    body_path,
+                )
+        else:
+            run(
+                "gh",
+                "pr",
+                "create",
+                "--repo",
+                args.repository,
+                "--base",
+                stable_branch,
+                "--head",
+                candidate_branch,
+                "--title",
+                f"Upgrade internal stable base to {tag}",
+                "--body-file",
+                body_path,
+            )
     finally:
         Path(body_path).unlink(missing_ok=True)
+
+    candidate_commit = run(
+        "git",
+        "rev-parse",
+        "HEAD" if candidate_changed else f"refs/remotes/{args.remote}/{candidate_branch}",
+        capture=True,
+    )
+    ensure_candidate_validation(
+        args.repository,
+        candidate_branch,
+        candidate_commit,
+    )
 
 
 if __name__ == "__main__":
