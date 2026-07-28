@@ -1,0 +1,28 @@
+name: Fork upstream stable upgrade
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+concurrency:
+  group: fork-upstream-stable-upgrade
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create-candidate:
+    if: github.repository == 'liuzqk/unity-mcp'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create upgrade candidate PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python tools/create_fork_upgrade_candidate.py

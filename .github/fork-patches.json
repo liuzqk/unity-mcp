@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "upstream_repository": "CoplayDev/unity-mcp",
+  "stable_branch": "zgs/stable",
+  "patches": [
+    {
+      "name": "project-scoped HTTP endpoint and ownership",
+      "upstream_pr": 1285
+    },
+    {
+      "name": "MCP session lifecycle and notification deduplication",
+      "upstream_pr": 1286
+    },
+    {
+      "name": "bounded WebSocket close before domain reload",
+      "upstream_pr": 1287
+    }
+  ]
+}
