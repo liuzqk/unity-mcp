@@ -132,6 +132,7 @@ class CustomToolService:
         unity_instance: str | None,
         params: dict[str, object] | None = None,
         user_id: str | None = None,
+        receipt_parent_id: str | None = None,
     ) -> MCPResponse:
         params = params or {}
         logger.info(
@@ -151,6 +152,8 @@ class CustomToolService:
             tool_name,
             params,
             user_id=user_id,
+            command_id=self._receipt_child_id(receipt_parent_id, 0),
+            parent_command_id=receipt_parent_id,
         )
 
         if not definition.requires_polling:
@@ -166,6 +169,7 @@ class CustomToolService:
             definition.poll_action or "status",
             user_id=user_id,
             max_poll_seconds=definition.max_poll_seconds or 0,
+            receipt_parent_id=receipt_parent_id,
         )
         logger.info(f"Tool '{tool_name}' polled response: {result}")
         return result
@@ -192,6 +196,7 @@ class CustomToolService:
         poll_action: str,
         user_id: str | None = None,
         max_poll_seconds: int = 0,
+        receipt_parent_id: str | None = None,
     ) -> MCPResponse:
         poll_params = dict(initial_params)
         poll_params["action"] = poll_action or "status"
@@ -199,6 +204,7 @@ class CustomToolService:
         timeout = max_poll_seconds if max_poll_seconds > 0 else _MAX_POLL_SECONDS
         deadline = time.time() + timeout
         response = initial_response
+        poll_index = 0
 
         while True:
             status, poll_interval = self._interpret_status(response)
@@ -216,12 +222,17 @@ class CustomToolService:
             await asyncio.sleep(poll_interval)
 
             try:
+                poll_index += 1
                 response = await send_with_unity_instance(
                     async_send_command_with_retry,
                     unity_instance,
                     tool_name,
                     poll_params,
                     user_id=user_id,
+                    command_id=self._receipt_child_id(
+                        receipt_parent_id, poll_index
+                    ),
+                    parent_command_id=receipt_parent_id,
                 )
             except Exception as exc:  # pragma: no cover - network/domain reload variability
                 logger.debug(f"Polling {tool_name} failed, will retry: {exc}")
@@ -231,6 +242,13 @@ class CustomToolService:
                     "_mcp_poll_interval": min(max(poll_interval * 2, _DEFAULT_POLL_INTERVAL), 5.0),
                     "message": f"Retrying after transient error: {exc}",
                 }
+
+    @staticmethod
+    def _receipt_child_id(parent_id: str | None, index: int) -> str | None:
+        if not parent_id:
+            return None
+        digest = sha256(f"{parent_id}:custom-tool:{index}".encode("utf-8")).hexdigest()
+        return f"command-{digest}"
 
     def _interpret_status(self, response) -> tuple[str, float]:
         if response is None:

@@ -46,6 +46,9 @@ async def send_with_unity_instance(
     user_id: str | None = None,
     **kwargs,
 ) -> T:
+    command_id = kwargs.pop("command_id", None)
+    envelope_sha256 = kwargs.pop("envelope_sha256", None)
+    parent_command_id = kwargs.pop("parent_command_id", None)
     if _is_http_transport():
         if not args:
             raise ValueError("HTTP transport requires command arguments")
@@ -82,6 +85,9 @@ async def send_with_unity_instance(
                 params,
                 user_id=user_id,
                 retry_on_reload=retry_on_reload,
+                command_id=command_id,
+                envelope_sha256=envelope_sha256,
+                parent_command_id=parent_command_id,
             )
             return normalize_unity_response(raw)
         except InstanceSelectionRequiredError as exc:
