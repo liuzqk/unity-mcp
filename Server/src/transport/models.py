@@ -22,6 +22,7 @@ class ExecuteCommandMessage(BaseModel):
     name: str
     params: dict[str, Any]
     timeout: float
+    envelope_sha256: str | None = None
 
 
 class PingMessage(BaseModel):
@@ -37,6 +38,7 @@ class RegisterMessage(BaseModel):
     project_hash: str
     unity_version: str = "Unknown"
     project_path: str | None = None  # Full path to project root (for focus nudging)
+    receipt_protocol: int = 0
 
 
 class RegisterToolsMessage(BaseModel):
@@ -54,6 +56,16 @@ class CommandResultMessage(BaseModel):
     id: str
     result: dict[str, Any] = Field(default_factory=dict)
 
+
+class CommandReceiptMessage(BaseModel):
+    type: str = "command_receipt"
+    id: str
+    project_hash: str
+    name: str
+    envelope_sha256: str
+    state: str
+    result: dict[str, Any] | None = None
+
 # Session Info (API response)
 
 
@@ -62,6 +74,7 @@ class SessionDetails(BaseModel):
     hash: str
     unity_version: str
     connected_at: str
+    receipt_protocol: int = 0
 
 
 class SessionList(BaseModel):

@@ -59,6 +59,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private int _isReconnectingFlag;
         private TransportState _state = TransportState.Disconnected(TransportDisplayName, "Transport not started");
         private string _apiKey;
+        private CommandReceiptJournal _receiptJournal;
         private bool _disposed;
 
         public WebSocketTransportClient(IToolDiscoveryService toolDiscoveryService = null)
@@ -86,6 +87,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             _apiKey = HttpEndpointUtility.IsRemoteScope()
                 ? EditorPrefs.GetString(EditorPrefKeys.ApiKey, string.Empty)
                 : string.Empty;
+            _receiptJournal = CommandReceiptJournal.ForCurrentProject();
 
             if (HttpEndpointUtility.IsRemoteScope()
                 && !HttpEndpointUtility.IsCurrentRemoteUrlAllowed(out string remoteUrlError))
@@ -521,6 +523,9 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 case "execute":
                     await HandleExecuteAsync(payload, token).ConfigureAwait(false);
                     break;
+                case "command_receipt_ack":
+                    HandleCommandReceiptAck(payload);
+                    break;
                 case "ping":
                     await SendPongAsync(token).ConfigureAwait(false);
                     break;
@@ -559,6 +564,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 McpLog.Info($"[WebSocket] Registered with session ID: {_sessionId}", false);
 
                 await SendRegisterToolsAsync(token).ConfigureAwait(false);
+                await SendCommandReceiptsAsync(token).ConfigureAwait(false);
             }
         }
 
@@ -642,12 +648,66 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             string commandId = payload.Value<string>("id");
             string commandName = payload.Value<string>("name");
             JObject parameters = payload.Value<JObject>("params") ?? new JObject();
+            string envelopeSha256 = payload.Value<string>("envelope_sha256");
             int timeoutSeconds = payload.Value<int?>("timeout") ?? (int)DefaultCommandTimeout.TotalSeconds;
 
             if (string.IsNullOrEmpty(commandId) || string.IsNullOrEmpty(commandName))
             {
                 McpLog.Warn("[WebSocket] Invalid execute payload (missing id or name)");
                 return;
+            }
+
+            CommandReceipt receipt = null;
+            if (!string.IsNullOrEmpty(envelopeSha256))
+            {
+                try
+                {
+                    bool receiptCreated;
+                    receipt = _receiptJournal.Begin(
+                        commandId,
+                        _projectHash,
+                        commandName,
+                        envelopeSha256,
+                        out receiptCreated);
+                    if (receipt.State == "completed")
+                    {
+                        await SendCommandResultAsync(
+                            commandId, receipt.Result.DeepClone(), token).ConfigureAwait(false);
+                        return;
+                    }
+                    if (receipt.Result != null || receipt.State != "started")
+                    {
+                        throw new InvalidDataException("Command receipt state is invalid.");
+                    }
+                    if (!receiptCreated)
+                    {
+                        await SendCommandResultAsync(
+                            commandId,
+                            new JObject
+                            {
+                                ["success"] = false,
+                                ["error"] = "Unity command started but did not persist a result.",
+                                ["receipt_state"] = "ambiguous",
+                                ["command_id"] = commandId
+                            },
+                            token).ConfigureAwait(false);
+                        return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    await SendCommandResultAsync(
+                        commandId,
+                        new JObject
+                        {
+                            ["success"] = false,
+                            ["error"] = ex.Message,
+                            ["receipt_state"] = "receipt_error",
+                            ["command_id"] = commandId
+                        },
+                        token).ConfigureAwait(false);
+                    return;
+                }
             }
 
             var commandEnvelope = new JObject
@@ -693,15 +753,74 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                     ["error"] = "Invalid response payload"
                 };
             }
-
-            var responsePayload = new JObject
+            if (receipt != null)
             {
-                ["type"] = "command_result",
-                ["id"] = commandId,
-                ["result"] = resultToken
-            };
+                try
+                {
+                    _receiptJournal.Complete(receipt, resultToken);
+                }
+                catch (Exception ex)
+                {
+                    resultToken = new JObject
+                    {
+                        ["success"] = false,
+                        ["error"] = $"Command result could not be persisted: {ex.Message}",
+                        ["receipt_state"] = "receipt_error",
+                        ["command_id"] = commandId
+                    };
+                }
+            }
 
-            await SendJsonAsync(responsePayload, token).ConfigureAwait(false);
+            await SendCommandResultAsync(commandId, resultToken, token).ConfigureAwait(false);
+        }
+
+        private Task SendCommandResultAsync(
+            string commandId, JToken result, CancellationToken token)
+        {
+            return SendJsonAsync(
+                new JObject
+                {
+                    ["type"] = "command_result",
+                    ["id"] = commandId,
+                    ["result"] = result
+                },
+                token);
+        }
+
+        private async Task SendCommandReceiptsAsync(CancellationToken token)
+        {
+            if (_receiptJournal == null) return;
+            foreach (CommandReceipt receipt in _receiptJournal.All())
+            {
+                var payload = new JObject
+                {
+                    ["type"] = "command_receipt",
+                    ["id"] = receipt.Id,
+                    ["project_hash"] = receipt.ProjectHash,
+                    ["name"] = receipt.Name,
+                    ["envelope_sha256"] = receipt.EnvelopeSha256,
+                    ["state"] = receipt.State
+                };
+                if (receipt.State == "completed")
+                {
+                    payload["result"] = receipt.Result.DeepClone();
+                }
+                await SendJsonAsync(payload, token).ConfigureAwait(false);
+            }
+        }
+
+        private void HandleCommandReceiptAck(JObject payload)
+        {
+            string commandId = payload.Value<string>("id");
+            if (string.IsNullOrEmpty(commandId) || _receiptJournal == null) return;
+            try
+            {
+                _receiptJournal.Acknowledge(commandId);
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"[WebSocket] Could not acknowledge command receipt: {ex.Message}");
+            }
         }
 
         private async Task KeepAliveLoopAsync(CancellationToken token)
@@ -739,7 +858,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 ["project_name"] = _projectName,
                 ["project_hash"] = _projectHash,
                 ["unity_version"] = _unityVersion,
-                ["project_path"] = _projectPath
+                ["project_path"] = _projectPath,
+                ["receipt_protocol"] = CommandReceiptJournal.ProtocolVersion
             };
 
             await SendJsonAsync(registerPayload, token).ConfigureAwait(false);

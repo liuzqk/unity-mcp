@@ -419,9 +419,23 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
                 command_type = body.get("type")
                 params = body.get("params", {})
                 unity_instance = body.get("unity_instance")
+                command_id = body.get("command_id")
+                envelope_sha256 = body.get("envelope_sha256")
 
                 if not command_type:
                     return JSONResponse({"success": False, "error": "Missing 'type' field"}, status_code=400)
+                if command_id is not None and (
+                    not isinstance(command_id, str)
+                    or not 8 <= len(command_id) <= 128
+                    or any(
+                        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                        for character in command_id
+                    )
+                ):
+                    return JSONResponse(
+                        {"success": False, "error": "Invalid command_id"},
+                        status_code=400,
+                    )
 
                 # Get available sessions
                 sessions = await PluginHub.get_sessions()
@@ -471,6 +485,15 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
 
                 # Custom tool execution - must be checked BEFORE the final PluginHub.send_command call
                 # This applies to both cases: with or without explicit unity_instance
+                if command_id and session_details.receipt_protocol < PluginHub.RECEIPT_PROTOCOL_VERSION:
+                    return JSONResponse(
+                        {
+                            "success": False,
+                            "error": "Unity plugin does not support durable command receipts.",
+                            "code": "receipt_protocol_unavailable",
+                        },
+                        status_code=409,
+                    )
                 if command_type == "execute_custom_tool":
                     # session_id and session_details are already set above
                     if not session_id or not session_details:
@@ -517,18 +540,73 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
                         )
 
                     service = CustomToolService.get_instance()
+                    if command_id:
+                        async def execute_custom_tool_with_receipt() -> dict[str, Any]:
+                            result = await service.execute_tool(
+                                project_id,
+                                tool_name,
+                                unity_instance_hint,
+                                tool_params,
+                                receipt_parent_id=command_id,
+                            )
+                            return result.model_dump()
+
+                        result = await PluginHub.run_durable_operation(
+                            command_id,
+                            command_type,
+                            params,
+                            session_details.hash,
+                            execute_custom_tool_with_receipt,
+                            envelope_sha256=envelope_sha256,
+                        )
+                        return JSONResponse(result)
                     result = await service.execute_tool(
                         project_id, tool_name, unity_instance_hint, tool_params
                     )
                     return JSONResponse(result.model_dump())
 
                 # Send command to Unity
-                result = await PluginHub.send_command(session_id, command_type, params)
+                result = await PluginHub.send_command(
+                    session_id,
+                    command_type,
+                    params,
+                    command_id=command_id,
+                    envelope_sha256=envelope_sha256,
+                    project_hash=session_details.hash,
+                )
                 return JSONResponse(result)
 
             except Exception as e:
                 logger.exception("CLI command error: %s", e)
                 return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+        @mcp.custom_route("/api/command-receipts/{command_id}", methods=["GET"])
+        async def cli_command_receipt_route(request: Request) -> JSONResponse:
+            command_id = request.path_params["command_id"]
+            project_hash = request.query_params.get("project_hash")
+            if not project_hash:
+                return JSONResponse(
+                    {"success": False, "error": "Missing project_hash"},
+                    status_code=400,
+                )
+            result = await PluginHub.command_receipt_status(command_id, project_hash)
+            return JSONResponse({"success": True, **result})
+
+        @mcp.custom_route("/api/command-receipts/{command_id}/ack", methods=["POST"])
+        async def cli_command_receipt_ack_route(request: Request) -> JSONResponse:
+            command_id = request.path_params["command_id"]
+            body = await request.json()
+            project_hash = body.get("project_hash")
+            if not project_hash:
+                return JSONResponse(
+                    {"success": False, "error": "Missing project_hash"},
+                    status_code=400,
+                )
+            acknowledged = await PluginHub.ack_command_receipt(command_id, project_hash)
+            return JSONResponse(
+                {"success": acknowledged, "command_id": command_id},
+                status_code=200 if acknowledged else 404,
+            )
 
         @mcp.custom_route("/api/instances", methods=["GET"])
         async def cli_instances_route(_: Request) -> JSONResponse:
@@ -543,6 +621,7 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
                         "hash": details.hash,
                         "unity_version": details.unity_version,
                         "connected_at": details.connected_at,
+                        "receipt_protocol": details.receipt_protocol,
                     })
                 return JSONResponse({"success": True, "instances": instances})
             except Exception as e:

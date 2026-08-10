@@ -10,7 +10,7 @@ import os
 import time
 import uuid
 import weakref
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, ClassVar
 
 import anyio
 from starlette.endpoints import WebSocketEndpoint
@@ -33,6 +33,7 @@ from transport.models import (
     RegisterToolsMessage,
     PongMessage,
     CommandResultMessage,
+    CommandReceiptMessage,
     SessionList,
     SessionDetails,
 )
@@ -176,6 +177,10 @@ class PluginHub(WebSocketEndpoint):
     _connections: dict[str, WebSocket] = {}
     # command_id -> {"future": Future, "session_id": str}
     _pending: dict[str, dict[str, Any]] = {}
+    _receipts: dict[str, dict[str, Any]] = {}
+    RECEIPT_PROTOCOL_VERSION = 1
+    RECEIPT_TTL_SECONDS = 24 * 60 * 60
+    MAX_RECEIPTS = 512
     _lock: asyncio.Lock | None = None
     _loop: asyncio.AbstractEventLoop | None = None
     # session_id -> last pong timestamp (monotonic)
@@ -200,6 +205,8 @@ class PluginHub(WebSocketEndpoint):
         cls._lock = asyncio.Lock()
         cls._published_tool_fingerprint = None
         cls._pending_tool_list_notifications.clear()
+        cls._pending.clear()
+        cls._receipts.clear()
         # Start tracking MCP client sessions for tool-change notifications
         if mcp is not None:
             _install_session_tracking()
@@ -274,7 +281,13 @@ class PluginHub(WebSocketEndpoint):
             elif message_type == "pong":
                 await self._handle_pong(PongMessage(**data))
             elif message_type == "command_result":
-                await self._handle_command_result(CommandResultMessage(**data))
+                await self._handle_command_result(
+                    websocket, CommandResultMessage(**data)
+                )
+            elif message_type == "command_receipt":
+                await self._handle_command_receipt(
+                    websocket, CommandReceiptMessage(**data)
+                )
             else:
                 logger.debug(f"Ignoring plugin message: {data}")
         except Exception as e:
@@ -308,7 +321,10 @@ class PluginHub(WebSocketEndpoint):
                     entry = cls._pending.get(command_id)
                     future = entry.get("future") if isinstance(
                         entry, dict) else None
-                    if future and not future.done():
+                    if isinstance(entry, dict) and entry.get("durable"):
+                        entry["session_id"] = None
+                        entry["needs_resend"] = True
+                    elif future and not future.done():
                         future.set_exception(
                             PluginDisconnectedError(
                                 f"Unity plugin session {session_id} disconnected while awaiting command_result"
@@ -322,11 +338,69 @@ class PluginHub(WebSocketEndpoint):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    @staticmethod
+    def command_envelope_sha256(command_type: str, params: dict[str, Any]) -> str:
+        encoded = json.dumps(
+            {"name": command_type, "params": params},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
     @classmethod
-    async def send_command(cls, session_id: str, command_type: str, params: dict[str, Any]) -> dict[str, Any]:
-        websocket = await cls._get_connection(session_id)
-        command_id = str(uuid.uuid4())
-        future: asyncio.Future = asyncio.get_running_loop().create_future()
+    def _prune_receipts(cls) -> None:
+        cutoff = time.time() - cls.RECEIPT_TTL_SECONDS
+        for command_id, receipt in list(cls._receipts.items()):
+            if float(receipt.get("updated_at", 0)) < cutoff:
+                cls._receipts.pop(command_id, None)
+        for command_id, entry in list(cls._pending.items()):
+            if not entry.get("durable") or float(entry.get("created_at", 0)) >= cutoff:
+                continue
+            result = {
+                "success": False,
+                "error": "Unity command receipt recovery window expired.",
+                "receipt_state": "ambiguous",
+                "command_id": command_id,
+            }
+            cls._receipts[command_id] = {
+                "state": "ambiguous",
+                "project_hash": entry.get("project_hash"),
+                "command_type": entry.get("command_type"),
+                "envelope_sha256": entry.get("envelope_sha256"),
+                "result": result,
+                "server_only": bool(entry.get("server_only")),
+                "children": list(entry.get("children", [])),
+                "updated_at": time.time(),
+            }
+            cls._pending.pop(command_id, None)
+            future = entry.get("future")
+            if future and not future.done():
+                future.set_result(result)
+
+    @classmethod
+    async def send_command(
+        cls,
+        session_id: str,
+        command_type: str,
+        params: dict[str, Any],
+        *,
+        command_id: str | None = None,
+        envelope_sha256: str | None = None,
+        project_hash: str | None = None,
+        parent_command_id: str | None = None,
+    ) -> dict[str, Any]:
+        durable = command_id is not None
+        command_id = command_id or str(uuid.uuid4())
+        expected_envelope = cls.command_envelope_sha256(command_type, params)
+        if envelope_sha256 and envelope_sha256 != expected_envelope:
+            return {
+                "success": False,
+                "error": "Command receipt envelope hash does not match the request.",
+                "receipt_state": "conflict",
+                "command_id": command_id,
+            }
+        envelope_sha256 = expected_envelope
         # Compute a per-command timeout:
         # - fast-path commands: short timeout (encourage retry)
         # - long-running commands: allow caller to request a longer timeout via params
@@ -362,33 +436,129 @@ class PluginHub(WebSocketEndpoint):
         if lock is None:
             raise RuntimeError("PluginHub not configured")
 
+        websocket = None
+        should_send = True
         async with lock:
-            if command_id in cls._pending:
-                raise RuntimeError(
-                    f"Duplicate command id generated: {command_id}")
-            cls._pending[command_id] = {
-                "future": future, "session_id": session_id}
+            cls._prune_receipts()
+            parent = None
+            if parent_command_id is not None:
+                parent = cls._pending.get(parent_command_id) or cls._receipts.get(
+                    parent_command_id
+                )
+                if parent is None or not parent.get("server_only"):
+                    return {
+                        "success": False,
+                        "error": "Parent command receipt is unavailable.",
+                        "receipt_state": "conflict",
+                        "command_id": command_id,
+                    }
+            receipt = cls._receipts.get(command_id)
+            if receipt is not None:
+                if (
+                    project_hash is not None
+                    and receipt.get("project_hash") != project_hash
+                ) or receipt.get("envelope_sha256") != envelope_sha256:
+                    return {
+                        "success": False,
+                        "error": "Command id is already bound to another envelope.",
+                        "receipt_state": "conflict",
+                        "command_id": command_id,
+                    }
+                if receipt.get("state") == "completed":
+                    return dict(receipt["result"])
+                return {
+                    "success": False,
+                    "error": "Unity command started but did not persist a result.",
+                    "receipt_state": "ambiguous",
+                    "command_id": command_id,
+                }
+            entry = cls._pending.get(command_id)
+            if entry is not None:
+                if (
+                    project_hash is not None
+                    and entry.get("project_hash") != project_hash
+                ) or entry.get("envelope_sha256") != envelope_sha256:
+                    return {
+                        "success": False,
+                        "error": "Command id is already bound to another envelope.",
+                        "receipt_state": "conflict",
+                        "command_id": command_id,
+                    }
+                future = entry["future"]
+                should_send = bool(entry.get("needs_resend"))
+                if should_send:
+                    entry["session_id"] = session_id
+                    entry["needs_resend"] = False
+            else:
+                if (
+                    durable
+                    and len(cls._receipts) + len(cls._pending) >= cls.MAX_RECEIPTS
+                ):
+                    return {
+                        "success": False,
+                        "error": "Command receipt capacity is exhausted.",
+                        "receipt_state": "capacity",
+                        "command_id": command_id,
+                    }
+                future = asyncio.get_running_loop().create_future()
+                cls._pending[command_id] = {
+                    "future": future,
+                    "session_id": session_id,
+                    "command_type": command_type,
+                    "project_hash": project_hash,
+                    "envelope_sha256": envelope_sha256,
+                    "durable": durable,
+                    "needs_resend": False,
+                    "created_at": time.time(),
+                }
+            if parent_command_id is not None:
+                children = parent.setdefault("children", [])
+                if command_id not in children:
+                    children.append(command_id)
 
         try:
-            msg = ExecuteCommandMessage(
-                id=command_id,
-                name=command_type,
-                params=params,
-                timeout=unity_timeout_s,
-            )
+            if should_send:
+                websocket = await cls._get_connection(session_id)
+                msg = ExecuteCommandMessage(
+                    id=command_id,
+                    name=command_type,
+                    params=params,
+                    timeout=unity_timeout_s,
+                    envelope_sha256=envelope_sha256 if durable else None,
+                )
+                try:
+                    await websocket.send_json(msg.model_dump())
+                except Exception:
+                    if durable:
+                        async with lock:
+                            entry = cls._pending.get(command_id)
+                            if entry is not None:
+                                entry["needs_resend"] = True
+                                entry["session_id"] = None
+                    elif not future.done():
+                        future.set_exception(
+                            PluginDisconnectedError(
+                                "Unity plugin disconnected while dispatching command"
+                            )
+                        )
+                    raise
             try:
-                await websocket.send_json(msg.model_dump())
-            except Exception as exc:
-                # If send fails (socket already closing), fail the future so callers don't hang.
-                if not future.done():
-                    future.set_exception(exc)
-                raise
-            try:
-                result = await asyncio.wait_for(future, timeout=server_wait_s)
+                awaited = asyncio.shield(future) if durable else future
+                result = await asyncio.wait_for(awaited, timeout=server_wait_s)
                 return result
             except PluginDisconnectedError as exc:
-                return MCPResponse(success=False, error=str(exc), hint="retry").model_dump()
+                return MCPResponse(
+                    success=False, error=str(exc), hint="retry"
+                ).model_dump()
             except asyncio.TimeoutError:
+                if durable:
+                    return {
+                        "success": False,
+                        "error": f"Unity command receipt is still pending after {server_wait_s:.1f}s.",
+                        "hint": "receipt_pending",
+                        "receipt_state": "pending",
+                        "command_id": command_id,
+                    }
                 if command_type in cls._FAST_FAIL_COMMANDS:
                     return MCPResponse(
                         success=False,
@@ -397,8 +567,9 @@ class PluginHub(WebSocketEndpoint):
                     ).model_dump()
                 raise
         finally:
-            async with lock:
-                cls._pending.pop(command_id, None)
+            if not durable:
+                async with lock:
+                    cls._pending.pop(command_id, None)
 
     @classmethod
     async def get_sessions(cls, user_id: str | None = None) -> SessionList:
@@ -417,10 +588,124 @@ class PluginHub(WebSocketEndpoint):
                     hash=session.project_hash,
                     unity_version=session.unity_version,
                     connected_at=session.connected_at.isoformat(),
+                    receipt_protocol=session.receipt_protocol,
                 )
                 for session_id, session in sessions.items()
             }
         )
+
+    @classmethod
+    async def run_durable_operation(
+        cls,
+        command_id: str,
+        command_type: str,
+        params: dict[str, Any],
+        project_hash: str,
+        operation: Callable[[], Awaitable[dict[str, Any]]],
+        *,
+        envelope_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        expected_envelope = cls.command_envelope_sha256(command_type, params)
+        if envelope_sha256 and envelope_sha256 != expected_envelope:
+            return {
+                "success": False,
+                "error": "Command receipt envelope hash does not match the request.",
+                "receipt_state": "conflict",
+                "command_id": command_id,
+            }
+
+        lock = cls._lock
+        if lock is None:
+            raise RuntimeError("PluginHub not configured")
+        owner = False
+        async with lock:
+            cls._prune_receipts()
+            receipt = cls._receipts.get(command_id)
+            if receipt is not None:
+                if (
+                    receipt.get("project_hash") != project_hash
+                    or receipt.get("envelope_sha256") != expected_envelope
+                ):
+                    return {
+                        "success": False,
+                        "error": "Command id is already bound to another envelope.",
+                        "receipt_state": "conflict",
+                        "command_id": command_id,
+                    }
+                if receipt.get("state") == "completed":
+                    return dict(receipt["result"])
+                return {
+                    "success": False,
+                    "error": "Unity command started but did not persist a result.",
+                    "receipt_state": "ambiguous",
+                    "command_id": command_id,
+                }
+            entry = cls._pending.get(command_id)
+            if entry is not None:
+                if (
+                    entry.get("project_hash") != project_hash
+                    or entry.get("envelope_sha256") != expected_envelope
+                    or not entry.get("server_only")
+                ):
+                    return {
+                        "success": False,
+                        "error": "Command id is already bound to another envelope.",
+                        "receipt_state": "conflict",
+                        "command_id": command_id,
+                    }
+                future = entry["future"]
+            else:
+                if len(cls._receipts) + len(cls._pending) >= cls.MAX_RECEIPTS:
+                    return {
+                        "success": False,
+                        "error": "Command receipt capacity is exhausted.",
+                        "receipt_state": "capacity",
+                        "command_id": command_id,
+                    }
+                future = asyncio.get_running_loop().create_future()
+                cls._pending[command_id] = {
+                    "future": future,
+                    "session_id": None,
+                    "command_type": command_type,
+                    "project_hash": project_hash,
+                    "envelope_sha256": expected_envelope,
+                    "durable": True,
+                    "server_only": True,
+                    "children": [],
+                    "created_at": time.time(),
+                }
+                owner = True
+
+        if owner:
+            async def execute_and_complete() -> None:
+                try:
+                    result = await operation()
+                except Exception as exc:
+                    result = {"success": False, "error": str(exc)}
+                async with lock:
+                    entry = cls._pending.pop(command_id, None)
+                    if entry is None:
+                        return
+                    cls._receipts[command_id] = {
+                        "state": "completed",
+                        "project_hash": project_hash,
+                        "command_type": command_type,
+                        "envelope_sha256": expected_envelope,
+                        "result": result,
+                        "server_only": True,
+                        "children": list(entry.get("children", [])),
+                        "updated_at": time.time(),
+                    }
+                if not future.done():
+                    future.set_result(result)
+
+            task = asyncio.create_task(execute_and_complete())
+            async with lock:
+                entry = cls._pending.get(command_id)
+                if entry is not None:
+                    entry["operation_task"] = task
+
+        return await asyncio.shield(future)
 
     @classmethod
     async def get_tools_for_project(
@@ -478,6 +763,7 @@ class PluginHub(WebSocketEndpoint):
         project_hash = payload.project_hash
         unity_version = payload.unity_version
         project_path = payload.project_path
+        receipt_protocol = payload.receipt_protocol
 
         if not project_hash:
             await websocket.close(code=4400)
@@ -492,7 +778,15 @@ class PluginHub(WebSocketEndpoint):
         response = RegisteredMessage(session_id=session_id)
         await websocket.send_json(response.model_dump())
 
-        session, evicted_session_id = await registry.register(session_id, project_name, project_hash, unity_version, project_path, user_id=user_id)
+        session, evicted_session_id = await registry.register(
+            session_id,
+            project_name,
+            project_hash,
+            unity_version,
+            project_path,
+            user_id=user_id,
+            receipt_protocol=receipt_protocol,
+        )
         evicted_ws = None
         async with lock:
             # Clean up the evicted session's connection, ping loop, and pending commands
@@ -507,6 +801,10 @@ class PluginHub(WebSocketEndpoint):
                 for command_id, entry in list(cls._pending.items()):
                     if entry.get("session_id") == evicted_session_id:
                         future = entry.get("future")
+                        if entry.get("durable"):
+                            entry["session_id"] = session_id
+                            entry["needs_resend"] = True
+                            continue
                         if future and not future.done():
                             future.set_exception(
                                 PluginDisconnectedError(
@@ -817,7 +1115,9 @@ class PluginHub(WebSocketEndpoint):
             len(_active_mcp_sessions),
         )
 
-    async def _handle_command_result(self, payload: CommandResultMessage) -> None:
+    async def _handle_command_result(
+        self, websocket: WebSocket, payload: CommandResultMessage
+    ) -> None:
         cls = type(self)
         lock = cls._lock
         if lock is None:
@@ -831,9 +1131,161 @@ class PluginHub(WebSocketEndpoint):
 
         async with lock:
             entry = cls._pending.get(command_id)
+            if isinstance(entry, dict) and entry.get("durable"):
+                session_id = next(
+                    (
+                        sid
+                        for sid, value in cls._connections.items()
+                        if value is websocket
+                    ),
+                    None,
+                )
+                if entry.get("session_id") != session_id:
+                    logger.warning(
+                        "Rejected command result from the wrong plugin session"
+                    )
+                    return
+                receipt_state = (
+                    "ambiguous"
+                    if result.get("receipt_state") in {"ambiguous", "receipt_error"}
+                    else "completed"
+                )
+                cls._receipts[command_id] = {
+                    "state": receipt_state,
+                    "project_hash": entry.get("project_hash"),
+                    "command_type": entry.get("command_type"),
+                    "envelope_sha256": entry.get("envelope_sha256"),
+                    "result": result,
+                    "updated_at": time.time(),
+                }
+                cls._pending.pop(command_id, None)
         future = entry.get("future") if isinstance(entry, dict) else None
         if future and not future.done():
             future.set_result(result)
+
+    async def _handle_command_receipt(
+        self, websocket: WebSocket, payload: CommandReceiptMessage
+    ) -> None:
+        cls = type(self)
+        lock = cls._lock
+        registry = cls._registry
+        if lock is None or registry is None:
+            return
+        async with lock:
+            session_id = next(
+                (sid for sid, value in cls._connections.items() if value is websocket),
+                None,
+            )
+        session = await registry.get_session(session_id) if session_id else None
+        if (
+            session is None
+            or session.receipt_protocol < cls.RECEIPT_PROTOCOL_VERSION
+            or session.project_hash != payload.project_hash
+        ):
+            logger.warning("Rejected command receipt from an incompatible session")
+            return
+        if payload.state not in {"started", "completed"}:
+            logger.warning(
+                "Rejected command receipt with invalid state %s", payload.state
+            )
+            return
+
+        result = payload.result or {}
+        async with lock:
+            cls._prune_receipts()
+            entry = cls._pending.get(payload.id)
+            receipt = cls._receipts.get(payload.id)
+            bound = entry or receipt
+            if bound is not None and (
+                bound.get("project_hash") != payload.project_hash
+                or bound.get("envelope_sha256") != payload.envelope_sha256
+            ):
+                logger.error(
+                    "Rejected command receipt envelope conflict for %s", payload.id
+                )
+                return
+            if (
+                bound is None
+                and len(cls._receipts) + len(cls._pending) >= cls.MAX_RECEIPTS
+            ):
+                logger.error("Rejected command receipt because capacity is exhausted")
+                return
+            state = "completed" if payload.state == "completed" else "ambiguous"
+            cls._receipts[payload.id] = {
+                "state": state,
+                "project_hash": payload.project_hash,
+                "command_type": payload.name,
+                "envelope_sha256": payload.envelope_sha256,
+                "result": result,
+                "updated_at": time.time(),
+            }
+            if entry is not None:
+                cls._pending.pop(payload.id, None)
+        future = entry.get("future") if isinstance(entry, dict) else None
+        if future and not future.done():
+            if state == "completed":
+                future.set_result(result)
+            else:
+                future.set_result(
+                    {
+                        "success": False,
+                        "error": "Unity command started but did not persist a result.",
+                        "receipt_state": "ambiguous",
+                        "command_id": payload.id,
+                    }
+                )
+
+    @classmethod
+    async def command_receipt_status(
+        cls, command_id: str, project_hash: str
+    ) -> dict[str, Any]:
+        lock = cls._lock
+        if lock is None:
+            raise RuntimeError("PluginHub not configured")
+        async with lock:
+            cls._prune_receipts()
+            receipt = cls._receipts.get(command_id)
+            if receipt is not None:
+                if receipt.get("project_hash") != project_hash:
+                    return {"state": "conflict", "command_id": command_id}
+                value = {"state": receipt["state"], "command_id": command_id}
+                if receipt["state"] == "completed":
+                    value["result"] = receipt["result"]
+                return value
+            entry = cls._pending.get(command_id)
+            if entry is not None:
+                if entry.get("project_hash") != project_hash:
+                    return {"state": "conflict", "command_id": command_id}
+                return {"state": "pending", "command_id": command_id}
+        return {"state": "missing", "command_id": command_id}
+
+    @classmethod
+    async def ack_command_receipt(cls, command_id: str, project_hash: str) -> bool:
+        lock = cls._lock
+        registry = cls._registry
+        if lock is None or registry is None:
+            raise RuntimeError("PluginHub not configured")
+        async with lock:
+            receipt = cls._receipts.get(command_id)
+            if receipt is None or receipt.get("project_hash") != project_hash:
+                return False
+            children = list(receipt.get("children", []))
+            server_only = bool(receipt.get("server_only"))
+        session_id = await registry.get_session_id_by_hash(project_hash)
+        receipt_ids = children + ([] if server_only else [command_id])
+        if receipt_ids and not session_id:
+            return False
+        if receipt_ids:
+            websocket = await cls._get_connection(session_id)
+            for receipt_id in receipt_ids:
+                await websocket.send_json(
+                    {"type": "command_receipt_ack", "id": receipt_id}
+                )
+        async with lock:
+            for receipt_id in children:
+                cls._receipts.pop(receipt_id, None)
+            cls._receipts.pop(command_id, None)
+        return True
 
     async def _handle_pong(self, payload: PongMessage) -> None:
         cls = type(self)
@@ -938,6 +1390,10 @@ class PluginHub(WebSocketEndpoint):
             keys_to_remove: list[object] = []
             for key, entry in list(cls._pending.items()):
                 if entry.get("session_id") == session_id:
+                    if entry.get("durable"):
+                        entry["session_id"] = None
+                        entry["needs_resend"] = True
+                        continue
                     future = entry.get("future")
                     if future and not future.done():
                         pending_futures.append(future)
@@ -1158,6 +1614,9 @@ class PluginHub(WebSocketEndpoint):
         params: dict[str, Any],
         user_id: str | None = None,
         retry_on_reload: bool = True,
+        command_id: str | None = None,
+        envelope_sha256: str | None = None,
+        parent_command_id: str | None = None,
     ) -> dict[str, Any]:
         """Send a command to a Unity instance.
 
@@ -1227,7 +1686,18 @@ class PluginHub(WebSocketEndpoint):
                         hint="retry",
                     ).model_dump()
 
-        return await cls.send_command(session_id, command_type, params)
+        registry = cls._registry
+        session = await registry.get_session(session_id) if registry else None
+        project_hash = session.project_hash if session else None
+        return await cls.send_command(
+            session_id,
+            command_type,
+            params,
+            command_id=command_id,
+            envelope_sha256=envelope_sha256,
+            project_hash=project_hash,
+            parent_command_id=parent_command_id,
+        )
 
     # ------------------------------------------------------------------
     # Blocking helpers for synchronous tool code
