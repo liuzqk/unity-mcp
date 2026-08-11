@@ -115,6 +115,44 @@ async def test_completed_receipt_recovers_disconnected_command(receipt_hub):
 
 
 @pytest.mark.asyncio
+async def test_unsolicited_completed_receipt_recovers_after_server_state_loss(
+    receipt_hub,
+):
+    websocket = await _session(receipt_hub)
+    params = {"value": 22}
+    digest = PluginHub.command_envelope_sha256("probe", params)
+
+    assert PluginHub._pending == {}
+    assert PluginHub._receipts == {}
+    await _hub()._handle_command_receipt(
+        websocket,
+        CommandReceiptMessage(
+            id="command-after-restart",
+            project_hash="project-hash",
+            name="probe",
+            envelope_sha256=digest,
+            state="completed",
+            result={"success": True, "count": 1},
+        ),
+    )
+
+    recovered = await PluginHub.send_command(
+        "session",
+        "probe",
+        params,
+        command_id="command-after-restart",
+        envelope_sha256=digest,
+        project_hash="project-hash",
+    )
+
+    assert recovered == {"success": True, "count": 1}
+    assert not any(
+        call.args[0].get("type") == "execute"
+        for call in websocket.send_json.await_args_list
+    )
+
+
+@pytest.mark.asyncio
 async def test_started_receipt_is_ambiguous_and_never_replayed(receipt_hub):
     websocket = await _session(receipt_hub)
     params = {"value": 3}

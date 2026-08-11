@@ -93,5 +93,40 @@ namespace MCPForUnityTests.Editor.Services
 
             Assert.That(journal.All(), Is.Empty);
         }
+
+        [Test]
+        public void CorruptedReceiptFailsClosedWithoutDeletingEvidence()
+        {
+            Directory.CreateDirectory(_root);
+            string path = Path.Combine(_root, "corrupt.json");
+            File.WriteAllText(path, "{not-json");
+            var journal = new CommandReceiptJournal(_root);
+
+            Assert.Throws<InvalidDataException>(() => journal.Begin(
+                "corrupt", "project", "probe", new string('a', 64), out _));
+            Assert.That(File.Exists(path), Is.True);
+            Assert.That(File.ReadAllText(path), Is.EqualTo("{not-json"));
+        }
+
+        [Test]
+        public void CapacityExhaustionDoesNotEvictUnacknowledgedReceipts()
+        {
+            var journal = new CommandReceiptJournal(_root);
+            for (int index = 0; index < CommandReceiptJournal.MaximumReceipts; index++)
+            {
+                journal.Begin(
+                    "command-" + index,
+                    "project",
+                    "probe",
+                    new string('a', 64),
+                    out _);
+            }
+
+            Assert.Throws<InvalidOperationException>(() => journal.Begin(
+                "overflow", "project", "probe", new string('b', 64), out _));
+            Assert.That(
+                journal.All(),
+                Has.Count.EqualTo(CommandReceiptJournal.MaximumReceipts));
+        }
     }
 }
